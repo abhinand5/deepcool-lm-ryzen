@@ -1,6 +1,6 @@
 [Unit]
 Description=Deepcool LM360 LCD Display Driver
-After=systemd-udev-settle.service lm_sensors.service
+After=lm_sensors.service
 Wants=lm_sensors.service
 
 [Service]
@@ -18,4 +18,4 @@ User=root
 ExecStartPre=-/bin/rm -f /var/run/deepcool-lm.sock
 
 [Install]
-WantedBy=sysinit.target
+WantedBy=multi-user.target

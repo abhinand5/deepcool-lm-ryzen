@@ -8,6 +8,8 @@ import usb.util
 import sys
 import time
 import argparse
+import glob
+import re
 import psutil
 import socket
 import json
@@ -281,33 +283,137 @@ def load_fonts():
         default = ImageFont.load_default()
         return {k: default for k in ['medium', 'normal', 'normal_bold', 'small']}
 
-def get_system_info():
-    """Get all system information"""
-    info = {
-        'cpu_temp': 0.0,
-        'gpu_temp': 0.0,
-        'cpu_percent': 0.0,
-        'cpu_freq': 0.0,
-    }
+def get_cpu_temp():
+    """CPU temperature in °C, or None if no sensor is found.
 
-    # CPU temperature
+    AMD: k10temp driver, Tctl (hottest CCD). Intel: coretemp, hottest core.
+    Falls back to scanning hwmon labels for a CPU diode/TSI reading
+    (e.g. motherboard Super I/O).
+    """
     try:
         temps = psutil.sensors_temperatures()
-        if 'coretemp' in temps and len(temps['coretemp']) > 0:
-            info['cpu_temp'] = round(temps['coretemp'][0].current, 1)
-        if 'nvme' in temps and len(temps['nvme']) > 0:
-            info['gpu_temp'] = round(temps['nvme'][0].current, 1)
-    except:
-        pass
+        k10 = temps.get('k10temp', [])
+        if k10:
+            for s in k10:
+                if s.label == 'Tctl' and s.current:
+                    return round(s.current, 1)
+            if k10[0].current:
+                return round(k10[0].current, 1)
+        core = temps.get('coretemp', [])
+        cur = [s.current for s in core if s.current]
+        if cur:
+            return round(max(cur), 1)
+    except Exception as e:
+        print(f"CPU temp read error: {e}", file=sys.stderr)
 
-    # CPU usage and frequency
+    # Fallback: scan hwmon labels for Tctl/Diode (covers Super I/O TSI)
+    try:
+        for hwmon in sorted(glob.glob('/sys/class/hwmon/hwmon*')):
+            label_file = os.path.join(hwmon, 'label')
+            if not os.path.isfile(label_file):
+                continue
+            try:
+                labels = open(label_file, 'rb').read().split(b'\0')
+            except OSError:
+                continue
+            for i, lab in enumerate(labels):
+                text = lab.decode('ascii', 'ignore')
+                if text.startswith('Tctl') or text.startswith('Diode'):
+                    try:
+                        val = int(open(os.path.join(hwmon, f'temp{i + 1}_input')).read())
+                        return round(val / 1000, 1)
+                    except (OSError, ValueError):
+                        continue
+    except Exception as e:
+        print(f"CPU temp fallback error: {e}", file=sys.stderr)
+    return None
+
+def get_dgpu_temp():
+    """Discrete GPU temperature in °C, or None if no GPU sensor is found.
+
+    Scans sysfs hwmon entries for amdgpu/radeon/nvidia. Systems with a
+    CPU iGPU expose multiple amdgpu entries; the discrete card is the
+    one with the most temperature sensors (edge + junction + mem vs the
+    iGPU's single edge reading).
+    """
+    best = None  # (sensor_count, temp)
+    for hwmon in sorted(glob.glob('/sys/class/hwmon/hwmon*')):
+        try:
+            name = open(os.path.join(hwmon, 'name')).read().strip()
+        except OSError:
+            continue
+        if name not in ('amdgpu', 'radeon', 'nvidia'):
+            continue
+        inputs = {}
+        labels = {}
+        for f in os.listdir(hwmon):
+            m = re.match(r'temp([0-9]+)_(input|label)$', f)
+            if not m:
+                continue
+            try:
+                val = open(os.path.join(hwmon, f)).read().strip()
+            except OSError:
+                continue
+            if m.group(2) == 'input':
+                try:
+                    inputs[int(m.group(1))] = int(val) / 1000
+                except ValueError:
+                    pass
+            else:
+                labels[int(m.group(1))] = val
+        if not inputs:
+            continue
+        # Prefer the sensor labelled 'edge' (GPU edge temp), else the first
+        val = None
+        for idx, lab in labels.items():
+            if lab == 'edge' and idx in inputs:
+                val = inputs[idx]
+                break
+        if val is None:
+            val = inputs[1]
+        if best is None or len(inputs) > best[0]:
+            best = (len(inputs), round(val, 1))
+    return best[1] if best else None
+
+def get_cpu_freq_ghz():
+    """Average per-core CPU frequency in GHz.
+
+    psutil.cpu_freq() reads /proc/cpuinfo, which only reports core 0's
+    frequency and lags behind (often an idle P-state), so read
+    scaling_cur_freq of every core instead — the same figure btop shows.
+    """
+    vals = []
+    for f in glob.glob('/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq'):
+        try:
+            v = int(open(f).read())
+            if v > 0:
+                vals.append(v)
+        except (OSError, ValueError):
+            pass
+    if vals:
+        # scaling_cur_freq is in kHz
+        return round(sum(vals) / len(vals) / 1_000_000.0, 2)
+    try:
+        freq = psutil.cpu_freq()
+        if freq and freq.current:
+            return round(freq.current / 1000, 2)
+    except Exception as e:
+        print(f"CPU freq read error: {e}", file=sys.stderr)
+    return 0.0
+
+def get_system_info():
+    """Get all system information. Temps may be None when no sensor exists."""
+    info = {
+        'cpu_temp': get_cpu_temp(),
+        'gpu_temp': get_dgpu_temp(),
+        'cpu_percent': 0.0,
+        'cpu_freq': get_cpu_freq_ghz(),
+    }
+
     try:
         info['cpu_percent'] = round(psutil.cpu_percent(interval=0.1), 1)
-        freq = psutil.cpu_freq()
-        if freq:
-            info['cpu_freq'] = round(freq.current / 1000, 2)
-    except:
-        pass
+    except Exception as e:
+        print(f"CPU usage read error: {e}", file=sys.stderr)
 
     return info
 
@@ -345,7 +451,8 @@ def render_monitor_display(info, fonts):
     draw = ImageDraw.Draw(img)
 
     # === CPU SECTION (Top Half) ===
-    cpu_color = get_temp_color(info['cpu_temp'])
+    cpu_temp = info['cpu_temp']
+    cpu_color = get_temp_color(cpu_temp) if cpu_temp is not None else (110, 110, 130)
 
     # CPU rounded border box
     draw_rounded_rect(draw, [12, 10, 308, 125], radius=8, outline=(40, 40, 50), width=2)
@@ -353,7 +460,7 @@ def render_monitor_display(info, fonts):
     # CPU Label (BOLD) with icon and temperature
     draw.text((20, 20), "⚙ CPU", fill=(110, 110, 130), font=fonts['normal_bold'])
 
-    cpu_temp_text = f"{info['cpu_temp']:.0f}°"
+    cpu_temp_text = f"{cpu_temp:.0f}°" if cpu_temp is not None else "--"
     bbox = draw.textbbox((0, 0), cpu_temp_text, font=fonts['medium'])
     text_w = bbox[2] - bbox[0]
     draw.text((WIDTH - 20 - text_w, 20), cpu_temp_text, fill=cpu_color, font=fonts['medium'])
@@ -374,7 +481,8 @@ def render_monitor_display(info, fonts):
                           radius=bar_radius, fill=bar_color, outline=None)
 
     # === GPU SECTION (Bottom Half) ===
-    gpu_color = get_temp_color(info['gpu_temp'])
+    gpu_temp = info['gpu_temp']
+    gpu_color = get_temp_color(gpu_temp) if gpu_temp is not None else (110, 110, 130)
 
     # GPU rounded border box
     draw_rounded_rect(draw, [12, 135, 308, 230], radius=8, outline=(40, 40, 50), width=2)
@@ -382,7 +490,7 @@ def render_monitor_display(info, fonts):
     # GPU Label (BOLD) with icon and temperature
     draw.text((20, 145), "▣ GPU", fill=(110, 110, 130), font=fonts['normal_bold'])
 
-    gpu_temp_text = f"{info['gpu_temp']:.0f}°"
+    gpu_temp_text = f"{gpu_temp:.0f}°" if gpu_temp is not None else "--"
     bbox = draw.textbbox((0, 0), gpu_temp_text, font=fonts['medium'])
     text_w = bbox[2] - bbox[0]
     draw.text((WIDTH - 20 - text_w, 145), gpu_temp_text, fill=gpu_color, font=fonts['medium'])
@@ -392,7 +500,7 @@ def render_monitor_display(info, fonts):
     bar_radius = bar_h // 2  # Fully rounded (half the height)
     draw_rounded_rect(draw, [bar_x, bar_y, bar_x + bar_w, bar_y + bar_h],
                       radius=bar_radius, fill=(30, 30, 38), outline=None)
-    fill_w = int(bar_w * min(info['gpu_temp'] / 100.0, 1.0))
+    fill_w = int(bar_w * min((gpu_temp or 0) / 100.0, 1.0))
     if fill_w >= bar_radius * 2:  # Only draw if wide enough for rounded corners
         draw_rounded_rect(draw, [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h],
                           radius=bar_radius, fill=gpu_color, outline=None)
@@ -435,7 +543,10 @@ def cmd_monitor(device, args):
                 device.send_frame(framebuffer)
 
                 frame_count += 1
-                print(f"[MONITOR] Frame {frame_count:4d} | CPU: {info['cpu_temp']:5.1f}°C ({info['cpu_percent']:4.1f}%) | GPU: {info['gpu_temp']:5.1f}°C | {info['cpu_freq']:.2f}GHz", end='\r')
+                if sys.stdout.isatty():
+                    cpu_str = f"{info['cpu_temp']:5.1f}°C" if info['cpu_temp'] is not None else "   --  "
+                    gpu_str = f"{info['gpu_temp']:5.1f}°C" if info['gpu_temp'] is not None else "   --  "
+                    print(f"[MONITOR] Frame {frame_count:4d} | CPU: {cpu_str} ({info['cpu_percent']:4.1f}%) | GPU: {gpu_str} | {info['cpu_freq']:.2f}GHz", end='\r')
             elif mode in ['image', 'solid']:
                 # Display static content
                 if data:

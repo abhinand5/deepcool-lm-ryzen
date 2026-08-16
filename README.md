@@ -203,8 +203,9 @@ This will:
 - **Supported actions**: monitor, image, solid, brightness_up, brightness_down
 
 ### Temperature Sources
-- **CPU**: `coretemp` sensor (first core)
-- **GPU**: `nvme` sensor (if available)
+- **CPU**: `k10temp` (AMD, Tctl) or `coretemp` (Intel, hottest core)
+- **GPU**: discrete GPU edge temperature (`amdgpu`/`nvidia` hwmon; CPU iGPU ignored)
+- **CPU clock**: average of per-core `scaling_cur_freq`
 
 The driver uses `psutil.sensors_temperatures()` to read system temperatures. You can check available sensors with:
 
@@ -250,6 +251,7 @@ sensors
 You may need to load kernel modules:
 ```bash
 sudo modprobe coretemp  # For Intel CPUs
+sudo modprobe k10temp   # For AMD CPUs (usually built-in)
 ```
 
 ## Development
